@@ -1,9 +1,9 @@
 {
   "name": "guardrails-git",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Git and GitHub safety guards for Claude: branch protection, commit boilerplate blocking, PR boilerplate blocking, timeout enforcement for git/gh commands",
   "license": "MIT",
   "hooks": {
-    "PreToolUse": "hooks/pre_tool_use.py"
+    "PreToolUse": "hooks/guardrails_git_pre_tool_use.py"
   }
 }
