@@ -214,32 +214,12 @@ def add_timeout_to_gh_run_watch(tool_name, tool_input):
                 sys.exit(1)
 
 
-def block_git_dash_c(tool_name, tool_input):
-    if tool_name != 'Bash':
-        return
-    command = tool_input.get('command', '')
-    if not command:
-        return
-    if re.search(r'\bgit\s+-C\b', command):
-        decision = {
-            "decision": "block",
-            "reason": (
-                "The git -C flag is not allowed. "
-                "Do not use 'git -C <path>' to run git commands in another directory. "
-                "Instead, run the git command directly from the target repository's working directory."
-            )
-        }
-        print(json.dumps(decision))
-        sys.exit(1)
-
-
 def main():
     try:
         input_data = json.load(sys.stdin)
         tool_name = input_data.get('tool_name', '')
         tool_input = input_data.get('tool_input', {})
 
-        block_git_dash_c(tool_name, tool_input)
         add_timeout_to_git_commit(tool_name, tool_input)
         add_timeout_to_git_push(tool_name, tool_input)
         add_timeout_to_gh_run_watch(tool_name, tool_input)
