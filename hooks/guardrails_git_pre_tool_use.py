@@ -105,13 +105,19 @@ def parse_git_invocation(segment):
     return None
 
 
+def _is_short_sticky(tok, opts):
+    """True for git's stuck short-option form, e.g. '-bname' for '-b name'."""
+    return (tok.startswith('-') and not tok.startswith('--')
+            and len(tok) > 2 and tok[:2] in opts)
+
+
 def _classify_checkout_switch(args, create_opts):
     """Return (creates_branch, first_positional_target) for checkout/switch args."""
     creates, target = False, None
     for tok in args:
         if tok == '--':
             break
-        if tok in create_opts or (tok.startswith('--') and tok.split('=', 1)[0] in create_opts):
+        if tok.split('=', 1)[0] in create_opts or _is_short_sticky(tok, create_opts):
             creates = True
         elif not tok.startswith('-') and target is None:
             target = tok
@@ -125,8 +131,8 @@ def _branch_creates(args):
     for tok in args:
         if tok == '--':
             break
-        key = tok.split('=', 1)[0] if tok.startswith('--') else tok
-        if key in BRANCH_NON_CREATE_OPTS:
+        key = tok.split('=', 1)[0] if tok.startswith('-') else tok
+        if key in BRANCH_NON_CREATE_OPTS or _is_short_sticky(tok, BRANCH_NON_CREATE_OPTS):
             return False
         if not tok.startswith('-'):
             positionals.append(tok)

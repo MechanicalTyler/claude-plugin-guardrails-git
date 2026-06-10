@@ -39,6 +39,12 @@ BLOCKED_CREATION_OFF_MAIN = [
     "GIT_TRACE=1 git branch feature/new-thing",
     "env git branch feature/new-thing",
     "/usr/bin/git branch feature/new-thing",
+    "git checkout -bfeature/new-thing",
+    "git checkout -Bfeature/new-thing",
+    "git switch -cfeature/new-thing",
+    "git switch -Cfeature/new-thing",
+    "git switch -c=feature/new-thing",
+    "git switch --create=feature/new-thing",
 ]
 
 
@@ -78,6 +84,8 @@ ALLOWED_NON_CREATION = [
     "git branch --unset-upstream",
     "git branch --sort=-committerdate --list",
     "git branch --edit-description",
+    "git branch -uorigin/feature/x mybranch",
+    "git branch -c=old new",
     "git checkout feature/existing-branch",
     "git switch feature/existing-branch",
     "git switch -",
