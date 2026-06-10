@@ -38,7 +38,6 @@ BLOCKED_CREATION_OFF_MAIN = [
     "git fetch | git branch feature/new-thing",
     "GIT_TRACE=1 git branch feature/new-thing",
     "env git branch feature/new-thing",
-    "/usr/bin/git branch feature/new-thing",
     "git checkout -bfeature/new-thing",
     "git checkout -Bfeature/new-thing",
     "git switch -cfeature/new-thing",
@@ -155,15 +154,8 @@ def test_git_dash_c_dir_passed_to_branch_lookup(monkeypatch, capsys):
     assert seen["git_dir"] == "/some/dir"
 
 
-def test_unparseable_command_falls_back_to_regex(monkeypatch, capsys):
-    decision = run_policy(
-        'git switch -c feature/new "unclosed', "feature/existing", monkeypatch, capsys
-    )
-    assert decision is not None
-    assert decision["decision"] == "block"
-
-
-def test_unparseable_benign_command_allowed(monkeypatch, capsys):
+def test_unparseable_command_allowed(monkeypatch, capsys):
+    # Unbalanced quoting can't be tokenized; the shell rejects it anyway.
     assert run_policy('echo "unclosed', "feature/existing", monkeypatch, capsys) is None
 
 

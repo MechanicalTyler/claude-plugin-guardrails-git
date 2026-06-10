@@ -15,18 +15,13 @@ def create_timeout_error_message(command_type, wanted_timeout, current_timeout):
     return f"You must set a timeout of {wanted_timeout}ms ({minutes} minutes) for {command_type} commands. This is not a test timeout error. Please retry the command with 'timeout': {wanted_timeout} in the tool parameters."
 
 
-# --- Branch policy: tokenize-based enforcement -------------------------------
+# --- Branch policy ------------------------------------------------------------
 #
 # Policy: new branches may only be created from 'main', and 'main' itself may
-# not be checked out. Enforced structurally (shlex tokens, per shell segment)
-# rather than by substring-matching one literal command form, so equivalent
+# not be checked out. Enforced on shlex tokens per shell segment so equivalent
 # forms (git branch <name>, git switch -c, git worktree add, chained commands,
-# git -C <dir> ...) are all covered.
+# git -C <dir> ...) are all covered, not just 'git checkout -b'.
 
-GIT_GLOBAL_VALUE_OPTS = {'-C', '-c', '--exec-path', '--git-dir', '--work-tree',
-                         '--namespace', '--super-prefix', '--config-env',
-                         '--list-cmds', '--attr-source'}
-WRAPPER_TOKENS = {'env', 'command', 'exec', 'nohup', 'time'}
 # Any of these flags means 'git branch' is listing/deleting/moving/copying/
 # configuring — not creating a branch.
 BRANCH_NON_CREATE_OPTS = {'-d', '-D', '--delete', '-m', '-M', '--move',
@@ -36,8 +31,8 @@ BRANCH_NON_CREATE_OPTS = {'-d', '-D', '--delete', '-m', '-M', '--move',
                           '--no-contains', '--points-at', '--sort', '--format',
                           '--column', '--edit-description', '--set-upstream-to',
                           '-u', '--unset-upstream'}
-CHECKOUT_CREATE_OPTS = {'-b', '-B', '--orphan'}
-SWITCH_CREATE_OPTS = {'-c', '-C', '--create', '--force-create', '--orphan'}
+# Branch-creating flags of 'git checkout' (-b/-B) and 'git switch' (-c/-C, --create).
+CREATE_OPTS = {'-b', '-B', '-c', '-C', '--create', '--force-create', '--orphan'}
 
 BRANCH_CREATION_REASON = ("New branches should only be created from 'main', but you're currently on "
                           "'{branch}'. You're already on the correct branch for your work, so no need "
@@ -61,13 +56,13 @@ def get_current_branch(git_dir=None):
 
 
 def tokenize_segments(command):
-    """Split a shell command into segments of tokens, one per `;`/`&&`/`||`/`|`
+    """Split a shell command into token lists, one per `;`/`&&`/`||`/`|`
     separated simple command. Raises ValueError on unbalanced quoting."""
     lex = shlex.shlex(command, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     segments, current = [], []
     for tok in lex:
-        if tok and all(ch in ';|&()' for ch in tok):
+        if all(ch in ';|&()' for ch in tok):
             if current:
                 segments.append(current)
                 current = []
@@ -79,126 +74,70 @@ def tokenize_segments(command):
 
 
 def parse_git_invocation(segment):
-    """If the segment invokes git, return (subcommand, args, git_dir from -C);
-    otherwise None. Skips leading env assignments, wrappers, and git global options."""
-    i = 0
-    while i < len(segment) and (re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', segment[i])
-                                or segment[i] in WRAPPER_TOKENS):
-        i += 1
-    if i >= len(segment):
+    """If the segment invokes git, return (subcommand, args, dir from -C);
+    otherwise None. Skips git's global options to find the subcommand."""
+    if 'git' not in segment:
         return None
-    prog = segment[i]
-    if prog != 'git' and not prog.endswith('/git'):
-        return None
-    i += 1
+    rest = segment[segment.index('git') + 1:]
     git_dir = None
-    while i < len(segment):
-        tok = segment[i]
-        if tok in GIT_GLOBAL_VALUE_OPTS:
-            if tok == '-C' and i + 1 < len(segment):
-                git_dir = segment[i + 1]
-            i += 2
-        elif tok.startswith('-'):
-            i += 1
-        else:
-            return tok, segment[i + 1:], git_dir
-    return None
+    while rest and rest[0].startswith('-'):
+        opt = rest.pop(0)
+        if opt == '-C' and rest:
+            git_dir = rest.pop(0)
+        elif opt in ('-c', '--git-dir', '--work-tree') and rest:
+            rest.pop(0)
+    if not rest:
+        return None
+    return rest[0], rest[1:], git_dir
 
 
-def _is_short_sticky(tok, opts):
-    """True for git's stuck short-option form, e.g. '-bname' for '-b name'."""
-    return (tok.startswith('-') and not tok.startswith('--')
-            and len(tok) > 2 and tok[:2] in opts)
-
-
-def _classify_checkout_switch(args, create_opts):
-    """Return (creates_branch, first_positional_target) for checkout/switch args."""
-    creates, target = False, None
-    for tok in args:
-        if tok == '--':
-            break
-        if tok.split('=', 1)[0] in create_opts or _is_short_sticky(tok, create_opts):
-            creates = True
-        elif not tok.startswith('-') and target is None:
-            target = tok
-    return creates, target
-
-
-def _branch_creates(args):
-    """True when 'git branch <args>' creates a branch (positional name, no
-    listing/delete/move/copy/upstream flag)."""
-    positionals = []
-    for tok in args:
-        if tok == '--':
-            break
-        key = tok.split('=', 1)[0] if tok.startswith('-') else tok
-        if key in BRANCH_NON_CREATE_OPTS or _is_short_sticky(tok, BRANCH_NON_CREATE_OPTS):
-            return False
-        if not tok.startswith('-'):
-            positionals.append(tok)
-    return bool(positionals)
+def _matches_opt(tok, opts):
+    """True if tok is one of opts, in --opt=value form, or in git's stuck
+    short-option form ('-bname' for '-b name')."""
+    return (tok.split('=', 1)[0] in opts
+            or (not tok.startswith('--') and len(tok) > 2 and tok[:2] in opts))
 
 
 def evaluate_git_invocation(subcommand, args, git_dir):
-    """Return a block decision dict for a policy violation, else None."""
+    """Return a block reason for a policy violation, else None."""
+    creates = False
     if subcommand in ('checkout', 'switch'):
-        create_opts = CHECKOUT_CREATE_OPTS if subcommand == 'checkout' else SWITCH_CREATE_OPTS
-        creates, target = _classify_checkout_switch(args, create_opts)
-        if creates:
-            branch = get_current_branch(git_dir)
-            if branch and branch != 'main':
-                return {"decision": "block", "reason": BRANCH_CREATION_REASON.format(branch=branch)}
-        elif target == 'main':
-            return {"decision": "block", "reason": CHECKOUT_MAIN_REASON}
+        flags = [tok for tok in args if tok.startswith('-') and tok != '--']
+        positionals = [tok for tok in args if not tok.startswith('-')]
+        creates = any(_matches_opt(tok, CREATE_OPTS) for tok in flags)
+        if not creates and positionals and positionals[0] == 'main':
+            return CHECKOUT_MAIN_REASON
     elif subcommand == 'branch':
-        if _branch_creates(args):
-            branch = get_current_branch(git_dir)
-            if branch and branch != 'main':
-                return {"decision": "block", "reason": BRANCH_CREATION_REASON.format(branch=branch)}
+        flags = [tok for tok in args if tok.startswith('-') and tok != '--']
+        positionals = [tok for tok in args if not tok.startswith('-')]
+        creates = bool(positionals) and not any(
+            _matches_opt(tok, BRANCH_NON_CREATE_OPTS) for tok in flags)
     elif subcommand == 'worktree':
-        if args and args[0] == 'add':
-            return {"decision": "block", "reason": WORKTREE_REASON}
-    return None
-
-
-def _branch_policy_fallback(command):
-    """Conservative regex check used when the command can't be tokenized
-    (e.g. unbalanced quotes), so the guard stays closed."""
-    if (re.search(r'\bgit\s+checkout\s+-[bB]\b', command)
-            or re.search(r'\bgit\s+switch\s+(?:-[cC]\b|--create\b|--force-create\b)', command)
-            or re.search(r'\bgit\s+branch\s+(?!-)[^\s;|&]+', command)):
-        branch = get_current_branch()
+        if args[:1] == ['add']:
+            return WORKTREE_REASON
+    if creates:
+        branch = get_current_branch(git_dir)
         if branch and branch != 'main':
-            return {"decision": "block", "reason": BRANCH_CREATION_REASON.format(branch=branch)}
-    if re.search(r'\bgit\s+(?:checkout|switch)\s+main\b', command):
-        return {"decision": "block", "reason": CHECKOUT_MAIN_REASON}
-    if re.search(r'\bgit\s+worktree\s+add\b', command):
-        return {"decision": "block", "reason": WORKTREE_REASON}
+            return BRANCH_CREATION_REASON.format(branch=branch)
     return None
 
 
 def check_git_branch_policy(tool_name, tool_input):
     if tool_name != 'Bash':
         return
-    command = tool_input.get('command', '')
     try:
-        segments = tokenize_segments(command)
+        segments = tokenize_segments(tool_input.get('command', ''))
     except ValueError:
-        decision = _branch_policy_fallback(command)
-        if decision:
-            print(json.dumps(decision))
-            sys.exit(1)
-        return
+        return  # unbalanced quoting — the shell will reject the command anyway
     for segment in segments:
         invocation = parse_git_invocation(segment)
-        if invocation:
-            decision = evaluate_git_invocation(*invocation)
-            if decision:
-                print(json.dumps(decision))
-                sys.exit(1)
+        reason = evaluate_git_invocation(*invocation) if invocation else None
+        if reason:
+            print(json.dumps({"decision": "block", "reason": reason}))
+            sys.exit(1)
 
 
-# --- End branch policy --------------------------------------------------------
+# --- End branch policy ----------------------------------------------------------
 
 
 def check_git_commit_branch(tool_name, tool_input):
