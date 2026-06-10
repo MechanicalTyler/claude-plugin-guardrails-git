@@ -39,9 +39,14 @@ BRANCH_CREATION_REASON = ("New branches should only be created from 'main', but 
                           "to create a new one.")
 CHECKOUT_MAIN_REASON = ("Claude isn't allowed to checkout the main branch. "
                         "Please ask the user what to do instead.")
-WORKTREE_REASON = ("Creating git worktrees is not allowed — 'git worktree add' creates branches and "
-                   "working trees outside the branch policy. Please continue working on the current "
-                   "branch instead.")
+WORKTREE_REASON = ("Git worktree commands are not allowed — worktrees create branches and working "
+                   "trees outside the branch policy. Please continue working on the current branch "
+                   "instead.")
+
+
+def _block(reason):
+    print(json.dumps({"decision": "block", "reason": reason}))
+    sys.exit(1)
 
 
 def get_current_branch(git_dir=None):
@@ -91,6 +96,24 @@ def parse_git_invocation(segment):
     return rest[0], rest[1:], git_dir
 
 
+def git_invocations(command):
+    """All git invocations in the command as (subcommand, args, dir) tuples."""
+    try:
+        segments = tokenize_segments(command)
+    except ValueError:
+        return []  # unbalanced quoting — the shell will reject the command anyway
+    return [inv for inv in map(parse_git_invocation, segments) if inv]
+
+
+def gh_invocations(command):
+    """Token lists following 'gh' in each shell segment of the command."""
+    try:
+        segments = tokenize_segments(command)
+    except ValueError:
+        return []
+    return [seg[seg.index('gh') + 1:] for seg in segments if 'gh' in seg]
+
+
 def _matches_opt(tok, opts):
     """True if tok is one of opts, in --opt=value form, or in git's stuck
     short-option form ('-bname' for '-b name')."""
@@ -113,8 +136,7 @@ def evaluate_git_invocation(subcommand, args, git_dir):
         creates = bool(positionals) and not any(
             _matches_opt(tok, BRANCH_NON_CREATE_OPTS) for tok in flags)
     elif subcommand == 'worktree':
-        if args[:1] == ['add']:
-            return WORKTREE_REASON
+        return WORKTREE_REASON
     if creates:
         branch = get_current_branch(git_dir)
         if branch and branch != 'main':
@@ -125,187 +147,138 @@ def evaluate_git_invocation(subcommand, args, git_dir):
 def check_git_branch_policy(tool_name, tool_input):
     if tool_name != 'Bash':
         return
-    try:
-        segments = tokenize_segments(tool_input.get('command', ''))
-    except ValueError:
-        return  # unbalanced quoting — the shell will reject the command anyway
-    for segment in segments:
-        invocation = parse_git_invocation(segment)
-        reason = evaluate_git_invocation(*invocation) if invocation else None
+    for invocation in git_invocations(tool_input.get('command', '')):
+        reason = evaluate_git_invocation(*invocation)
         if reason:
-            print(json.dumps({"decision": "block", "reason": reason}))
-            sys.exit(1)
+            _block(reason)
 
 
 # --- End branch policy ----------------------------------------------------------
 
 
 def check_git_commit_branch(tool_name, tool_input):
-    if tool_name == 'Bash':
-        command = tool_input.get('command', '')
-        if re.search(r'\bgit\s+commit\b', command):
-            try:
-                result = subprocess.run(['git', 'branch', '--show-current'],
-                                        capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
-                    current_branch = result.stdout.strip()
-                    if current_branch == 'main':
-                        decision = {
-                            "decision": "block",
-                            "reason": "Direct commits to the 'main' branch are not allowed. Please create a feature branch first (e.g., 'git checkout -b feature/your-feature-name') and commit your changes there, then create a pull request."
-                        }
-                        print(json.dumps(decision))
-                        sys.exit(1)
-            except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
-                pass
+    if tool_name != 'Bash':
+        return
+    for subcommand, args, git_dir in git_invocations(tool_input.get('command', '')):
+        if subcommand == 'commit' and get_current_branch(git_dir) == 'main':
+            _block("Direct commits to the 'main' branch are not allowed. Please create a feature "
+                   "branch first (e.g., 'git checkout -b feature/your-feature-name') and commit "
+                   "your changes there, then create a pull request.")
 
 
 def check_git_no_verify(tool_name, tool_input):
-    if tool_name == 'Bash':
-        command = tool_input.get('command', '')
-        if re.search(r'\bgit\s+(?:(?!-m|<<)[^;|&\n])*--no-verify\b', command):
-            decision = {
-                "decision": "block",
-                "reason": "The '--no-verify' flag is not allowed in git commands. You are never allowed to skip hooks"
-            }
-            print(json.dumps(decision))
-            sys.exit(1)
+    if tool_name != 'Bash':
+        return
+    for subcommand, args, git_dir in git_invocations(tool_input.get('command', '')):
+        for tok in args:
+            if tok == '--':
+                break
+            if tok == '--no-verify' or (subcommand == 'commit' and tok == '-n'):
+                _block("The '--no-verify' flag is not allowed in git commands. "
+                       "You are never allowed to skip hooks")
+
+
+CLAUDE_BOILERPLATE_PATTERNS = [
+    r'Generated with Claude Code',
+    r'Co-Authored by Claude',
+    r'Generated with \[Claude Code\]',
+    r'Co-Authored-By:\s*Claude',
+    r'<noreply@anthropic\.com>',
+    r'claude\.ai/code',
+    r'Generated by Claude',
+    r'Created with Claude Code',
+    r'Assisted by Claude',
+    r'With help from Claude',
+    r'@anthropic\.com',
+]
+AI_BOILERPLATE_PATTERNS = CLAUDE_BOILERPLATE_PATTERNS + [
+    r'AI-generated',
+    r'AI generated',
+    r'Generated by AI',
+    r'Created by AI',
+    r'Built with AI',
+]
+
+
+def _has_boilerplate(command, patterns):
+    return any(re.search(p, command, re.IGNORECASE) for p in patterns)
+
+
+def _gh_subcommand_present(command, words):
+    """True when the command runs `gh <words...>` (flags between words ignored)."""
+    for args in gh_invocations(command):
+        positionals = [tok for tok in args if not tok.startswith('-')]
+        if positionals[:len(words)] == words:
+            return True
+    return False
 
 
 def check_git_commit_boilerplate(tool_name, tool_input):
-    if tool_name == 'Bash':
-        command = tool_input.get('command', '')
-        if re.search(r'\bgit\s+commit\b', command):
-            boilerplate_patterns = [
-                r'Generated with Claude Code',
-                r'Co-Authored by Claude',
-                r'Generated with \[Claude Code\]',
-                r'Co-Authored-By:\s*Claude',
-                r'<noreply@anthropic\.com>',
-                r'claude\.ai/code',
-                r'Generated by Claude',
-                r'Created with Claude Code',
-                r'Assisted by Claude',
-                r'With help from Claude',
-                r'@anthropic\.com',
-            ]
-            for pattern in boilerplate_patterns:
-                if re.search(pattern, command, re.IGNORECASE):
-                    decision = {
-                        "decision": "block",
-                        "reason": "Boilerplate code patterns are not allowed in git commit messages. Please remove references to Claude Code, co-authorship with Claude, or Anthropic email addresses from your commit message and try again."
-                    }
-                    print(json.dumps(decision))
-                    sys.exit(1)
+    if tool_name != 'Bash':
+        return
+    command = tool_input.get('command', '')
+    if (any(sub == 'commit' for sub, _, _ in git_invocations(command))
+            and _has_boilerplate(command, CLAUDE_BOILERPLATE_PATTERNS)):
+        _block("Boilerplate code patterns are not allowed in git commit messages. Please remove "
+               "references to Claude Code, co-authorship with Claude, or Anthropic email addresses "
+               "from your commit message and try again.")
 
 
 def check_pr_create_boilerplate(tool_name, tool_input):
-    if tool_name == 'Bash':
-        command = tool_input.get('command', '')
-        if re.search(r'\bgh\s+pr\s+create\b', command):
-            boilerplate_patterns = [
-                r'Generated with Claude Code',
-                r'Co-Authored by Claude',
-                r'Generated with \[Claude Code\]',
-                r'Co-Authored-By:\s*Claude',
-                r'<noreply@anthropic\.com>',
-                r'claude\.ai/code',
-                r'Generated by Claude',
-                r'Created with Claude Code',
-                r'Assisted by Claude',
-                r'With help from Claude',
-                r'@anthropic\.com',
-                r'AI-generated',
-                r'AI generated',
-                r'Generated by AI',
-                r'Created by AI',
-                r'Built with AI',
-            ]
-            for pattern in boilerplate_patterns:
-                if re.search(pattern, command, re.IGNORECASE):
-                    decision = {
-                        "decision": "block",
-                        "reason": "Boilerplate patterns are not allowed in PR titles or descriptions. Please remove references to Claude Code, AI generation, co-authorship with Claude, or Anthropic email addresses from your PR content and try again."
-                    }
-                    print(json.dumps(decision))
-                    sys.exit(1)
+    if tool_name != 'Bash':
+        return
+    command = tool_input.get('command', '')
+    if (_gh_subcommand_present(command, ['pr', 'create'])
+            and _has_boilerplate(command, AI_BOILERPLATE_PATTERNS)):
+        _block("Boilerplate patterns are not allowed in PR titles or descriptions. Please remove "
+               "references to Claude Code, AI generation, co-authorship with Claude, or Anthropic "
+               "email addresses from your PR content and try again.")
+
+
+def _is_pr_comment_api_call(command):
+    for args in gh_invocations(command):
+        positionals = [tok for tok in args if not tok.startswith('-')]
+        if positionals[:1] == ['api'] and any(
+                re.search(r'repos/.+/issues/\d+/comments', tok) for tok in args):
+            return True
+    return False
 
 
 def check_pr_comment_boilerplate(tool_name, tool_input):
-    if tool_name == 'Bash':
-        command = tool_input.get('command', '')
-        if re.search(r'\bgh\s+api\s+repos/.+/issues/\d+/comments\b', command):
-            boilerplate_patterns = [
-                r'Generated with Claude Code',
-                r'Co-Authored by Claude',
-                r'Generated with \[Claude Code\]',
-                r'Co-Authored-By:\s*Claude',
-                r'<noreply@anthropic\.com>',
-                r'claude\.ai/code',
-                r'Generated by Claude',
-                r'Created with Claude Code',
-                r'Assisted by Claude',
-                r'With help from Claude',
-                r'@anthropic\.com',
-                r'AI-generated',
-                r'AI generated',
-                r'Generated by AI',
-                r'Created by AI',
-                r'Built with AI',
-            ]
-            for pattern in boilerplate_patterns:
-                if re.search(pattern, command, re.IGNORECASE):
-                    decision = {
-                        "decision": "block",
-                        "reason": "Boilerplate patterns are not allowed in PR comments. Please remove references to Claude Code, AI generation, co-authorship with Claude, or Anthropic email addresses from your comment and try again."
-                    }
-                    print(json.dumps(decision))
-                    sys.exit(1)
+    if tool_name != 'Bash':
+        return
+    command = tool_input.get('command', '')
+    if _is_pr_comment_api_call(command) and _has_boilerplate(command, AI_BOILERPLATE_PATTERNS):
+        _block("Boilerplate patterns are not allowed in PR comments. Please remove references to "
+               "Claude Code, AI generation, co-authorship with Claude, or Anthropic email addresses "
+               "from your comment and try again.")
+
+
+def _require_timeout(tool_input, command_type, wanted_timeout):
+    timeout = tool_input.get('timeout')
+    if timeout != wanted_timeout:
+        _block(create_timeout_error_message(command_type, wanted_timeout, timeout))
 
 
 def add_timeout_to_git_commit(tool_name, tool_input):
-    if tool_name == 'Bash':
-        command = tool_input.get('command', '')
-        timeout = tool_input.get('timeout')
-        if re.search(r'\bgit\s+commit\b', command):
-            wanted_timeout = 900000
-            if timeout != wanted_timeout:
-                decision = {
-                    "decision": "block",
-                    "reason": create_timeout_error_message("Git commit", wanted_timeout, timeout)
-                }
-                print(json.dumps(decision))
-                sys.exit(1)
+    if tool_name != 'Bash':
+        return
+    if any(sub == 'commit' for sub, _, _ in git_invocations(tool_input.get('command', ''))):
+        _require_timeout(tool_input, "Git commit", 900000)
 
 
 def add_timeout_to_git_push(tool_name, tool_input):
-    if tool_name == 'Bash':
-        command = tool_input.get('command', '')
-        timeout = tool_input.get('timeout')
-        if re.search(r'\bgit\s+push\b', command):
-            wanted_timeout = 900000
-            if timeout != wanted_timeout:
-                decision = {
-                    "decision": "block",
-                    "reason": create_timeout_error_message("Git push", wanted_timeout, timeout)
-                }
-                print(json.dumps(decision))
-                sys.exit(1)
+    if tool_name != 'Bash':
+        return
+    if any(sub == 'push' for sub, _, _ in git_invocations(tool_input.get('command', ''))):
+        _require_timeout(tool_input, "Git push", 900000)
 
 
 def add_timeout_to_gh_run_watch(tool_name, tool_input):
-    if tool_name == 'Bash':
-        command = tool_input.get('command', '')
-        timeout = tool_input.get('timeout')
-        if re.search(r'\bgh\s+run\s+watch\b', command):
-            wanted_timeout = 1800000
-            if timeout != wanted_timeout:
-                decision = {
-                    "decision": "block",
-                    "reason": create_timeout_error_message("gh run watch", wanted_timeout, timeout)
-                }
-                print(json.dumps(decision))
-                sys.exit(1)
+    if tool_name != 'Bash':
+        return
+    if _gh_subcommand_present(tool_input.get('command', ''), ['run', 'watch']):
+        _require_timeout(tool_input, "gh run watch", 1800000)
 
 
 def main():
