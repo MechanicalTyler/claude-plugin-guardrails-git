@@ -118,26 +118,18 @@ BLOCKED_WORKTREE = [
     "git worktree add ../wt",
     "git worktree add ../wt -b feature/new",
     "git worktree add --detach ../wt",
+    "git worktree list",
+    "git worktree remove ../wt",
+    "git worktree prune",
+    "git worktree",
 ]
 
 
 @pytest.mark.parametrize("command", BLOCKED_WORKTREE)
-def test_worktree_add_blocked(command, monkeypatch, capsys):
+def test_all_worktree_commands_blocked(command, monkeypatch, capsys):
     decision = run_policy(command, "feature/existing", monkeypatch, capsys)
     assert decision is not None, f"expected block: {command}"
     assert "worktree" in decision["reason"]
-
-
-ALLOWED_WORKTREE = [
-    "git worktree list",
-    "git worktree remove ../wt",
-    "git worktree prune",
-]
-
-
-@pytest.mark.parametrize("command", ALLOWED_WORKTREE)
-def test_other_worktree_subcommands_allowed(command, monkeypatch, capsys):
-    assert run_policy(command, "feature/existing", monkeypatch, capsys) is None
 
 
 def test_git_dash_c_dir_passed_to_branch_lookup(monkeypatch, capsys):
